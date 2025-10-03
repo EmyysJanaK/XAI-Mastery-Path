@@ -3,8 +3,7 @@
 import torch
 import torchaudio
 import numpy as np
-from transformers import WavLMModel, Wav2Vec2FeatureExtractor  # ✅ Fixed import
-from captum.attr._core.feature_ablation import FeatureAblation
+from transformers import WavLMModel, Wav2Vec2FeatureExtractor 
 import matplotlib.pyplot as plt
 import seaborn as sns
 import os
@@ -13,6 +12,16 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Any, Optional
 import json
 from tqdm import tqdm
+import warnings
+
+# Add missing imports for enhanced SHAP functionality
+try:
+    import shap
+    from scipy.stats import spearmanr
+    SHAP_AVAILABLE = True
+except ImportError:
+    SHAP_AVAILABLE = False
+    print("Warning: SHAP or scipy not available. Enhanced analysis features will be disabled.")
 
 class LayerWiseNeuronAblation:
     """
@@ -40,14 +49,6 @@ class LayerWiseNeuronAblation:
     def load_ravdess_sample(self, ravdess_path: str, emotion_label: str = None, actor_id: int = None) -> Tuple[str, Dict]:
         """
         Load a specific sample from RAVDESS dataset
-        
-        Args:
-            ravdess_path: Path to RAVDESS dataset
-            emotion_label: Specific emotion to load
-            actor_id: Specific actor ID (1-24)
-        
-        Returns:
-            Tuple of (audio_file_path, metadata)
         """
         # RAVDESS emotion mapping
         emotion_map = {
@@ -55,11 +56,7 @@ class LayerWiseNeuronAblation:
             5: "angry", 6: "fearful", 7: "disgust", 8: "surprised"
         }
         
-        reverse_emotion_map = {v: k for k, v in emotion_map.items()}
-        
         audio_files = []
-        
-        # Scan RAVDESS directory structure
         ravdess_path = Path(ravdess_path)
         
         for actor_folder in ravdess_path.glob("Actor_*"):
@@ -68,26 +65,16 @@ class LayerWiseNeuronAblation:
                 
             actor_num = int(actor_folder.name.split("_")[1])
             
-            # Filter by actor if specified
             if actor_id is not None and actor_num != actor_id:
                 continue
             
             for audio_file in actor_folder.glob("*.wav"):
-                # Parse RAVDESS filename: Modality-VocalChannel-Emotion-EmotionalIntensity-Statement-Repetition-Actor.wav
                 parts = audio_file.stem.split('-')
                 
                 if len(parts) >= 7:
-                    modality = int(parts[0])
-                    vocal_channel = int(parts[1])
                     emotion_id = int(parts[2])
-                    intensity = int(parts[3])
-                    statement = int(parts[4])
-                    repetition = int(parts[5])
-                    actor = int(parts[6])
-                    
                     emotion_name = emotion_map.get(emotion_id, "unknown")
                     
-                    # Filter by emotion if specified
                     if emotion_label is not None and emotion_name != emotion_label:
                         continue
                     
@@ -95,57 +82,34 @@ class LayerWiseNeuronAblation:
                         'file_path': str(audio_file),
                         'emotion_id': emotion_id,
                         'emotion_name': emotion_name,
-                        'intensity': intensity,
-                        'statement': statement,
-                        'repetition': repetition,
-                        'actor_id': actor,
-                        'gender': 'female' if actor % 2 == 0 else 'male'
+                        'intensity': int(parts[3]),
+                        'statement': int(parts[4]),
+                        'repetition': int(parts[5]),
+                        'actor_id': int(parts[6]),
+                        'gender': 'female' if int(parts[6]) % 2 == 0 else 'male'
                     }
                     
                     audio_files.append((str(audio_file), metadata))
         
         if not audio_files:
-            available_emotions = set()
-            for actor_folder in ravdess_path.glob("Actor_*"):
-                for audio_file in actor_folder.glob("*.wav"):
-                    parts = audio_file.stem.split('-')
-                    if len(parts) >= 3:
-                        emo_id = int(parts[2])
-                        available_emotions.add(emotion_map.get(emo_id, "unknown"))
-            
-            raise ValueError(f"No RAVDESS files found for emotion='{emotion_label}', actor='{actor_id}'. "
-                           f"Available emotions: {sorted(available_emotions)}")
+            raise ValueError(f"No RAVDESS files found for emotion='{emotion_label}', actor='{actor_id}'")
         
-        # Return random sample
         audio_path, metadata = random.choice(audio_files)
         print(f"Selected audio: {metadata['emotion_name']} emotion, Actor {metadata['actor_id']} ({metadata['gender']})")
         
         return audio_path, metadata
     
     def preprocess_audio(self, audio_path: str, target_sr: int = 16000) -> torch.Tensor:
-        """
-        Load and preprocess audio file for WavLM
-        
-        Args:
-            audio_path: Path to audio file
-            target_sr: Target sampling rate
-            
-        Returns:
-            Preprocessed audio tensor
-        """
-        # Load audio
+        """Load and preprocess audio file for WavLM"""
         waveform, sample_rate = torchaudio.load(audio_path)
         
-        # Resample if needed
         if sample_rate != target_sr:
             resampler = torchaudio.transforms.Resample(sample_rate, target_sr)
             waveform = resampler(waveform)
         
-        # Convert to mono if stereo
         if waveform.shape[0] > 1:
             waveform = torch.mean(waveform, dim=0, keepdim=True)
         
-        # ✅ Use feature extractor instead of processor
         inputs = self.feature_extractor(
             waveform.squeeze().numpy(), 
             sampling_rate=target_sr, 
@@ -155,29 +119,103 @@ class LayerWiseNeuronAblation:
         return inputs["input_values"].to(self.device)
     
     def create_task_metric(self, task_type: str = "emotion_representation"):
-        """Create task-specific metric function"""
+        """Create task-specific metric function with multiple options including SHAP XAI"""
         
         if task_type == "emotion_representation":
             def emotion_metric(model, audio_input):
                 """Measure quality of emotion representation"""
                 with torch.no_grad():
                     outputs = model(audio_input)
-                    # Use mean of last hidden state as emotion representation
-                    emotion_repr = outputs.last_hidden_state.mean(dim=1)  # [batch, hidden_size]
-                    # L2 norm as quality metric
+                    emotion_repr = outputs.last_hidden_state.mean(dim=1)
                     return emotion_repr.norm(dim=1).mean().item()
             return emotion_metric
-        
+            
         elif task_type == "hidden_state_variance":
             def variance_metric(model, audio_input):
                 """Measure variance in hidden states (diversity metric)"""
                 with torch.no_grad():
                     outputs = model(audio_input)
-                    hidden_states = outputs.last_hidden_state  # [batch, seq_len, hidden_size]
-                    # Variance across sequence dimension
+                    hidden_states = outputs.last_hidden_state
                     variance = hidden_states.var(dim=1).mean().item()
                     return variance
             return variance_metric
+        
+        elif task_type == "cosine_similarity":
+            def cosine_metric(model, audio_input):
+                with torch.no_grad():
+                    outputs = model(audio_input)
+                    emotion_repr = outputs.last_hidden_state.mean(dim=1)
+                    if hasattr(self, 'emotion_prototypes'):
+                        prototype = self.emotion_prototypes.get("happy", torch.zeros_like(emotion_repr))
+                        similarity = torch.cosine_similarity(emotion_repr, prototype, dim=1)
+                        return similarity.mean().item()
+                    else:
+                        return emotion_repr.norm(dim=1).mean().item()
+            return cosine_metric
+        
+        elif task_type == "representation_entropy":
+            def entropy_metric(model, audio_input):
+                with torch.no_grad():
+                    outputs = model(audio_input)
+                    emotion_repr = outputs.last_hidden_state.mean(dim=1)
+                    probs = torch.softmax(emotion_repr, dim=1)
+                    entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=1)
+                    return entropy.mean().item()
+            return entropy_metric
+        
+        elif task_type == "attention_concentration":
+            def attention_metric(model, audio_input):
+                with torch.no_grad():
+                    outputs = model(audio_input, output_attentions=True)
+                    if hasattr(outputs, 'attentions') and outputs.attentions:
+                        attention_weights = outputs.attentions[-1]
+                        entropy = -torch.sum(
+                            attention_weights * torch.log(attention_weights + 1e-8), 
+                            dim=-1
+                        ).mean().item()
+                        return -entropy
+                    else:
+                        emotion_repr = outputs.last_hidden_state.mean(dim=1)
+                        return emotion_repr.norm(dim=1).mean().item()
+            return attention_metric
+        
+        elif task_type == "shap_neuron_importance":
+            def shap_metric(model, audio_input):
+                """Use SHAP to measure overall model importance"""
+                if not SHAP_AVAILABLE:
+                    print("SHAP not available, falling back to L2 norm")
+                    with torch.no_grad():
+                        outputs = model(audio_input)
+                        emotion_repr = outputs.last_hidden_state.mean(dim=1)
+                        return emotion_repr.norm(dim=1).mean().item()
+                
+                try:
+                    # Use GradientExplainer instead of DeepExplainer for better compatibility
+                    def model_forward(x):
+                        outputs = model(x)
+                        emotion_repr = outputs.last_hidden_state.mean(dim=1)
+                        return emotion_repr.norm(dim=1).mean()
+                    
+                    # Create a simpler explainer
+                    explainer = shap.GradientExplainer(model, audio_input)
+                    shap_values = explainer.shap_values(audio_input)
+                    return torch.tensor(shap_values).abs().mean().item()
+                    
+                except Exception as e:
+                    print(f"SHAP GradientExplainer failed: {e}, trying alternative approach")
+                    try:
+                        # Alternative: Use model directly with SHAP
+                        background = torch.zeros_like(audio_input)
+                        explainer = shap.DeepExplainer(model, background)
+                        shap_values = explainer.shap_values(audio_input)
+                        return torch.tensor(shap_values).abs().mean().item()
+                    except Exception as e2:
+                        print(f"All SHAP methods failed: {e2}, falling back to L2 norm")
+                        with torch.no_grad():
+                            outputs = model(audio_input)
+                            emotion_repr = outputs.last_hidden_state.mean(dim=1)
+                            return emotion_repr.norm(dim=1).mean().item()
+            return shap_metric
         
         else:
             raise ValueError(f"Unknown task type: {task_type}")
@@ -188,33 +226,26 @@ class LayerWiseNeuronAblation:
                                       task_metric_fn,
                                       num_neurons_to_test: int = 50,
                                       ablation_method: str = "zero") -> Dict[int, Dict[str, float]]:
-        """
-        Find most important neurons in a specific layer using ablation
-        
-        Args:
-            audio_input: Preprocessed audio tensor
-            layer_idx: Layer index to analyze
-            task_metric_fn: Function to measure task performance
-            num_neurons_to_test: Number of neurons to test
-            ablation_method: How to ablate neurons
-            
-        Returns:
-            Dictionary mapping neuron indices to importance scores
-        """
+        """Find most important neurons in a specific layer using ablation"""
         print(f"\n🔍 Analyzing Layer {layer_idx} ({num_neurons_to_test} neurons)...")
         
-        # Get baseline performance (no ablation)
+        # Add memory management
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
         baseline_score = task_metric_fn(self.model, audio_input)
         print(f"  Baseline score: {baseline_score:.6f}")
         
         neuron_importance = {}
         layer = self.model.encoder.layers[layer_idx]
         
-        # Test individual neurons
         for neuron_idx in tqdm(range(min(num_neurons_to_test, self.hidden_size)), 
                               desc=f"Layer {layer_idx} neurons"):
             
-            # Create ablation hook for this specific neuron
+            # Clear cache periodically
+            if neuron_idx % 10 == 0 and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
             def create_ablation_hook(neuron_to_ablate):
                 def ablation_hook(module, input_tensor, output_tensor):
                     if isinstance(output_tensor, tuple):
@@ -224,7 +255,6 @@ class LayerWiseNeuronAblation:
                         hidden_states = output_tensor.clone()
                         other_outputs = ()
                     
-                    # Ablate the specific neuron
                     if ablation_method == "zero":
                         hidden_states[:, :, neuron_to_ablate] = 0.0
                     elif ablation_method == "mean":
@@ -237,18 +267,15 @@ class LayerWiseNeuronAblation:
                         random_vals = torch.normal(mean, std, shape, device=hidden_states.device)
                         hidden_states[:, :, neuron_to_ablate] = random_vals
                     
-                    # Return modified output
                     if other_outputs:
                         return (hidden_states,) + other_outputs
                     return hidden_states
                 
                 return ablation_hook
             
-            # Register hook
             hook = layer.register_forward_hook(create_ablation_hook(neuron_idx))
             
             try:
-                # Measure performance with ablated neuron
                 ablated_score = task_metric_fn(self.model, audio_input)
                 importance = baseline_score - ablated_score
                 
@@ -271,88 +298,246 @@ class LayerWiseNeuronAblation:
                     'error': str(e)
                 }
             finally:
-                # Always remove hook
                 hook.remove()
         
-        # Sort by importance and return
         sorted_neurons = dict(sorted(neuron_importance.items(), 
                                    key=lambda x: x[1]['importance_score'], 
                                    reverse=True))
         
-        # Print top neurons for this layer
         print(f"  Top 5 neurons in layer {layer_idx}:")
         for i, (neuron_idx, info) in enumerate(list(sorted_neurons.items())[:5]):
             print(f"    #{i+1}: Neuron {neuron_idx} (importance: {info['importance_score']:.6f})")
         
         return sorted_neurons
-    
-    def progressive_layer_ablation(self,
-                                 audio_input: torch.Tensor,
-                                 task_metric_fn,
-                                 layers_to_analyze: List[int] = None,
-                                 top_k_per_layer: int = 5,
-                                 neurons_to_test_per_layer: int = 50) -> Dict[int, Any]:
-        """
-        Perform progressive layer-by-layer ablation analysis
+
+    def get_shap_top_neurons_per_layer(self, audio_input: torch.Tensor, 
+                                     layer_idx: int, 
+                                     top_k: int = 10) -> List[Tuple[int, float]]:
+        """Use SHAP to identify top neurons in a specific layer - FIXED VERSION"""
+        if not SHAP_AVAILABLE:
+            print("SHAP not available, falling back to random neuron selection")
+            neurons_to_test = min(top_k, self.hidden_size)
+            random_neurons = random.sample(range(neurons_to_test), min(top_k, neurons_to_test))
+            return [(n, random.random()) for n in random_neurons]
         
-        Args:
-            audio_input: Preprocessed audio
-            task_metric_fn: Task performance metric
-            layers_to_analyze: Which layers to analyze (default: all)
-            top_k_per_layer: How many top neurons to track per layer
-            neurons_to_test_per_layer: How many neurons to test per layer
-            
-        Returns:
-            Complete analysis results
+        # Create a custom PyTorch module for SHAP compatibility
+        class NeuronExtractor(torch.nn.Module):
+            def __init__(self, base_model, layer_idx, neuron_idx):
+                super().__init__()
+                self.base_model = base_model
+                self.layer_idx = layer_idx
+                self.neuron_idx = neuron_idx
+                
+            def forward(self, x):
+                with torch.no_grad():
+                    outputs = self.base_model(x, output_hidden_states=True)
+                    hidden_states = outputs.hidden_states[self.layer_idx]
+                    neuron_activation = hidden_states[:, :, self.neuron_idx].mean(dim=1)
+                    return neuron_activation
+        
+        neuron_importance = {}
+        neurons_to_test = min(50, self.hidden_size)
+        
+        print(f"\n🔍 SHAP Analysis for Layer {layer_idx} (testing {neurons_to_test} neurons)...")
+        
+        for neuron_idx in tqdm(range(neurons_to_test), desc=f"SHAP Layer {layer_idx}"):
+            # Clear cache periodically
+            if neuron_idx % 10 == 0 and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
+            try:
+                # Create neuron extractor module
+                neuron_extractor = NeuronExtractor(self.model, layer_idx, neuron_idx)
+                
+                # Use GradientExplainer for better compatibility
+                background = torch.zeros_like(audio_input)
+                explainer = shap.GradientExplainer(neuron_extractor, background)
+                
+                # Get SHAP values
+                shap_values = explainer.shap_values(audio_input)
+                importance = torch.tensor(shap_values).abs().mean().item()
+                neuron_importance[neuron_idx] = importance
+                
+            except Exception as e:
+                print(f"    SHAP failed for neuron {neuron_idx}: {e}")
+                # Fallback to gradient-based importance
+                try:
+                    audio_input.requires_grad_(True)
+                    outputs = self.model(audio_input, output_hidden_states=True)
+                    hidden_states = outputs.hidden_states[layer_idx]
+                    neuron_activation = hidden_states[:, :, neuron_idx].mean()
+                    
+                    # Compute gradient
+                    neuron_activation.backward(retain_graph=True)
+                    gradient_importance = audio_input.grad.abs().mean().item()
+                    neuron_importance[neuron_idx] = gradient_importance
+                    
+                    # Reset gradients
+                    audio_input.grad = None
+                    audio_input.requires_grad_(False)
+                    
+                except Exception as e2:
+                    print(f"    Gradient fallback also failed for neuron {neuron_idx}: {e2}")
+                    neuron_importance[neuron_idx] = 0.0
+        
+        sorted_neurons = sorted(neuron_importance.items(), 
+                              key=lambda x: x[1], 
+                              reverse=True)[:top_k]
+        
+        print(f"  Top 5 SHAP neurons in layer {layer_idx}:")
+        for i, (neuron_idx, importance) in enumerate(sorted_neurons[:5]):
+            print(f"    #{i+1}: Neuron {neuron_idx} (SHAP importance: {importance:.6f})")
+        
+        return sorted_neurons
+
+    def compare_ablation_vs_shap_neurons(self, 
+                                       audio_input: torch.Tensor, 
+                                       layer_idx: int,
+                                       task_metric_fn,
+                                       top_k: int = 10) -> Dict[str, Any]:
+        """Compare neuron importance rankings from ablation study vs SHAP"""
+        if not SHAP_AVAILABLE:
+            print(f"SHAP not available, skipping comparison for Layer {layer_idx}")
+            return {'error': 'SHAP not available'}
+        
+        print(f"\n🔄 Comparing Ablation vs SHAP for Layer {layer_idx}")
+        
+        # Get ablation-based top neurons
+        print("Running ablation analysis...")
+        ablation_results = self.find_important_neurons_in_layer(
+            audio_input=audio_input,
+            layer_idx=layer_idx,
+            task_metric_fn=task_metric_fn,
+            num_neurons_to_test=50
+        )
+        
+        ablation_top = list(ablation_results.keys())[:top_k]
+        
+        # Get SHAP-based top neurons
+        print("Running SHAP analysis...")
+        shap_top = self.get_shap_top_neurons_per_layer(
+            audio_input=audio_input,
+            layer_idx=layer_idx,
+            top_k=top_k
+        )
+        
+        shap_neuron_indices = [neuron_idx for neuron_idx, _ in shap_top]
+        
+        # Calculate overlap
+        overlap = set(ablation_top) & set(shap_neuron_indices)
+        overlap_percentage = len(overlap) / top_k * 100
+        
+        # Rank correlation
+        common_neurons = list(overlap)
+        if len(common_neurons) > 2 and SHAP_AVAILABLE:
+            ablation_ranks = [ablation_top.index(n) for n in common_neurons]
+            shap_ranks = [shap_neuron_indices.index(n) for n in common_neurons]
+            correlation, p_value = spearmanr(ablation_ranks, shap_ranks)
+        else:
+            correlation, p_value = 0.0, 1.0
+        
+        results = {
+            'layer_idx': layer_idx,
+            'ablation_top_neurons': ablation_top,
+            'shap_top_neurons': shap_neuron_indices,
+            'overlap_neurons': list(overlap),
+            'overlap_percentage': overlap_percentage,
+            'rank_correlation': correlation,
+            'correlation_p_value': p_value,
+            'agreement_level': 'High' if overlap_percentage > 70 else 'Medium' if overlap_percentage > 40 else 'Low'
+        }
+        
+        print(f"\n📊 Comparison Results for Layer {layer_idx}:")
+        print(f"  Overlap: {len(overlap)}/{top_k} neurons ({overlap_percentage:.1f}%)")
+        print(f"  Rank correlation: {correlation:.3f} (p={p_value:.3f})")
+        print(f"  Agreement level: {results['agreement_level']}")
+        print(f"  Common important neurons: {list(overlap)}")
+        
+        return results
+
+    def enhanced_progressive_layer_ablation(self,
+                                          audio_input: torch.Tensor,
+                                          task_metric_fn,
+                                          layers_to_analyze: List[int] = None,
+                                          top_k_per_layer: int = 5,
+                                          use_shap: bool = False,
+                                          comparison_mode: bool = False) -> Dict[int, Any]:
+        """
+        Enhanced progressive ablation with SHAP integration
         """
         if layers_to_analyze is None:
             layers_to_analyze = list(range(self.num_layers))
         
-        print(f"\n🚀 Starting Progressive Layer-by-Layer Neuron Ablation")
-        print(f"Analyzing layers: {layers_to_analyze}")
-        print(f"Testing {neurons_to_test_per_layer} neurons per layer")
-        print(f"Tracking top {top_k_per_layer} neurons per layer")
+        print(f"\n🚀 Enhanced Progressive Layer Analysis")
+        print(f"Method: {'SHAP + Ablation' if use_shap else 'Ablation Only'}")
+        print(f"Comparison mode: {comparison_mode}")
         
         results = {
             'baseline_score': task_metric_fn(self.model, audio_input),
+            'method': 'shap+ablation' if use_shap else 'ablation',
             'layer_analysis': {},
+            'shap_comparisons': {} if comparison_mode else None,
             'progressive_ablation': {},
             'cumulative_effects': []
         }
         
-        print(f"Baseline performance: {results['baseline_score']:.6f}")
-        
-        # Step 1: Analyze each layer individually
-        print(f"\n{'='*60}")
-        print("STEP 1: INDIVIDUAL LAYER ANALYSIS")
-        print(f"{'='*60}")
-        
+        # Individual layer analysis
         for layer_idx in layers_to_analyze:
-            layer_results = self.find_important_neurons_in_layer(
-                audio_input=audio_input,
-                layer_idx=layer_idx,
-                task_metric_fn=task_metric_fn,
-                num_neurons_to_test=neurons_to_test_per_layer
-            )
+            
+            if comparison_mode:
+                comparison_result = self.compare_ablation_vs_shap_neurons(
+                    audio_input=audio_input,
+                    layer_idx=layer_idx,
+                    task_metric_fn=task_metric_fn,
+                    top_k=top_k_per_layer * 2
+                )
+                results['shap_comparisons'][layer_idx] = comparison_result
+                
+                # Use ablation results for progressive analysis
+                layer_results = self.find_important_neurons_in_layer(
+                    audio_input=audio_input,
+                    layer_idx=layer_idx,
+                    task_metric_fn=task_metric_fn,
+                    num_neurons_to_test=50
+                )
+                
+            elif use_shap and SHAP_AVAILABLE:
+                shap_neurons = self.get_shap_top_neurons_per_layer(
+                    audio_input=audio_input,
+                    layer_idx=layer_idx,
+                    top_k=top_k_per_layer * 2
+                )
+                
+                # Convert to ablation format for consistency
+                layer_results = {}
+                for i, (neuron_idx, shap_importance) in enumerate(shap_neurons):
+                    layer_results[neuron_idx] = {
+                        'importance_score': shap_importance,
+                        'method': 'shap',
+                        'layer_idx': layer_idx,
+                        'rank': i + 1
+                    }
+            else:
+                # Standard ablation analysis (fallback for all cases)
+                layer_results = self.find_important_neurons_in_layer(
+                    audio_input=audio_input,
+                    layer_idx=layer_idx,
+                    task_metric_fn=task_metric_fn,
+                    num_neurons_to_test=50
+                )
             
             results['layer_analysis'][layer_idx] = layer_results
-        
-        # Step 2: Progressive ablation (layer by layer)
-        print(f"\n{'='*60}")
-        print("STEP 2: PROGRESSIVE LAYER-BY-LAYER ABLATION")
-        print(f"{'='*60}")
-        
-        active_hooks = []  # Track active ablation hooks
+    
+        # Progressive ablation (same as original)
+        active_hooks = []
         cumulative_ablated_layers = []
         
         for layer_idx in sorted(layers_to_analyze):
             print(f"\n📍 Adding Layer {layer_idx} to progressive ablation...")
             
-            # Get top neurons from this layer
             layer_neurons = results['layer_analysis'][layer_idx]
             top_neurons = list(layer_neurons.keys())[:top_k_per_layer]
             
-            # Create progressive ablation hook for this layer
             layer = self.model.encoder.layers[layer_idx]
             
             def create_progressive_hook(neurons_to_ablate):
@@ -364,7 +549,6 @@ class LayerWiseNeuronAblation:
                         hidden_states = output_tensor.clone()
                         other_outputs = ()
                     
-                    # Ablate all specified neurons
                     for neuron_idx in neurons_to_ablate:
                         hidden_states[:, :, neuron_idx] = 0.0
                     
@@ -374,12 +558,10 @@ class LayerWiseNeuronAblation:
                 
                 return progressive_hook
             
-            # Register progressive hook
             hook = layer.register_forward_hook(create_progressive_hook(top_neurons))
             active_hooks.append((layer_idx, hook))
             cumulative_ablated_layers.append(layer_idx)
             
-            # Measure cumulative performance
             cumulative_score = task_metric_fn(self.model, audio_input)
             cumulative_drop = results['baseline_score'] - cumulative_score
             
@@ -400,20 +582,34 @@ class LayerWiseNeuronAblation:
             print(f"  Cumulative drop: {cumulative_drop:.6f}")
             print(f"  Incremental drop: {progressive_result['incremental_drop']:.6f}")
         
-        # Clean up all hooks
-        print(f"\n🧹 Cleaning up ablation hooks...")
+        # Cleanup
         for layer_idx, hook in active_hooks:
             hook.remove()
         
+        # Final memory cleanup
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
         return results
+        
     
     def visualize_layer_analysis(self, results: Dict, save_path: str = None):
         """Create comprehensive visualizations of layer-wise analysis"""
+        
+        # Add validation
+        if not results or 'layer_analysis' not in results:
+            print("Warning: No layer analysis results to visualize")
+            return
         
         fig, axes = plt.subplots(2, 2, figsize=(16, 12))
         
         # Extract data for plotting
         layers = sorted(results['layer_analysis'].keys())
+        
+        if not layers:
+            print("Warning: No layers found in results")
+            plt.close(fig)
+            return
         
         # Plot 1: Average importance per layer
         avg_importance_per_layer = []
@@ -527,62 +723,68 @@ class LayerWiseNeuronAblation:
 def run_complete_layer_wise_analysis(ravdess_path: str, 
                                    emotion: str = "happy",
                                    actor_id: int = None,
-                                   save_dir: str = "results"):
+                                   save_dir: str = "results",
+                                   use_enhanced_analysis: bool = False,
+                                   task_metric_type: str = "emotion_representation"):
     """
-    Run complete layer-wise neuron ablation analysis
-    
-    Args:
-        ravdess_path: Path to RAVDESS dataset
-        emotion: Emotion to analyze
-        actor_id: Specific actor ID (optional)
-        save_dir: Directory to save results
+    Run complete layer-wise neuron ablation analysis with optional SHAP integration
     """
+    # Add error handling for path validation
+    if not os.path.exists(ravdess_path):
+        raise FileNotFoundError(f"RAVDESS path not found: {ravdess_path}")
     
-    # Create results directory
+    # Create output directory
     os.makedirs(save_dir, exist_ok=True)
     
-    print("🎵 WAVLM LAYER-WISE NEURON ABLATION ANALYSIS")
-    print("="*60)
+    print(f"\n🎭 Starting Layer-wise Neuron Ablation Analysis")
+    print(f"Emotion: {emotion}")
+    print(f"Enhanced analysis: {use_enhanced_analysis}")
+    print(f"Task metric: {task_metric_type}")
     
     # Step 1: Initialize analyzer
     print("Step 1: Initializing WavLM analyzer...")
     analyzer = LayerWiseNeuronAblation()
     
     # Step 2: Load RAVDESS sample
-    print(f"Step 2: Loading RAVDESS sample (emotion: {emotion})...")
-    try:
-        audio_path, metadata = analyzer.load_ravdess_sample(
-            ravdess_path=ravdess_path,
-            emotion_label=emotion,
-            actor_id=actor_id
-        )
-        print(f"Loaded: {audio_path}")
-    except Exception as e:
-        print(f"Error loading RAVDESS sample: {e}")
-        return None
+    print("Step 2: Loading RAVDESS sample...")
+    audio_path, metadata = analyzer.load_ravdess_sample(
+        ravdess_path=ravdess_path,
+        emotion_label=emotion,
+        actor_id=actor_id
+    )
     
     # Step 3: Preprocess audio
     print("Step 3: Preprocessing audio...")
     audio_input = analyzer.preprocess_audio(audio_path)
-    print(f"Audio tensor shape: {audio_input.shape}")
     
-    # Step 4: Create task metric
-    print("Step 4: Creating task metric...")
-    task_metric = analyzer.create_task_metric("emotion_representation")
+    # Step 4: Create task metric (now with more options)
+    print(f"Step 4: Creating task metric ({task_metric_type})...")
+    task_metric = analyzer.create_task_metric(task_metric_type)
     
-    # Step 5: Run layer-wise analysis
+    # Step 5: Run analysis (choose enhanced or standard)
     print("Step 5: Running layer-wise neuron ablation...")
+    key_layers = [0, 2, 4, 6, 8, 10, 11]
     
-    # Analyze key layers (not all to save time)
-    key_layers = [0, 2, 4, 6, 8, 10, 11]  # Early, middle, and late layers
-    
-    results = analyzer.progressive_layer_ablation(
-        audio_input=audio_input,
-        task_metric_fn=task_metric,
-        layers_to_analyze=key_layers,
-        top_k_per_layer=5,
-        neurons_to_test_per_layer=30  # Test 30 neurons per layer
-    )
+    if use_enhanced_analysis:
+        # Use enhanced analysis with SHAP
+        results = analyzer.enhanced_progressive_layer_ablation(
+            audio_input=audio_input,
+            task_metric_fn=task_metric,
+            layers_to_analyze=key_layers,
+            top_k_per_layer=5,
+            use_shap=True,
+            comparison_mode=True  # Compare both methods
+        )
+    else:
+        # Use standard analysis (enhanced method without SHAP)
+        results = analyzer.enhanced_progressive_layer_ablation(
+            audio_input=audio_input,
+            task_metric_fn=task_metric,
+            layers_to_analyze=key_layers,
+            top_k_per_layer=5,
+            use_shap=False,
+            comparison_mode=False
+        )
     
     # Step 6: Visualize results
     print("Step 6: Creating visualizations...")
@@ -623,31 +825,49 @@ def run_complete_layer_wise_analysis(ravdess_path: str,
     return results, metadata
 
 
-# Example usage
 if __name__ == "__main__":
-    # CHANGE THIS PATH TO YOUR RAVDESS DATASET LOCATION
-    RAVDESS_PATH = r"C:\path\to\your\ravdess\dataset"  # ⚠️ UPDATE THIS PATH
+    RAVDESS_PATH = r"/kaggle/input/ravdess-emotional-speech-audio"  # ⚠️ UPDATE THIS PATH
     
-    # Test with different emotions
-    emotions_to_test = ["happy", "sad", "angry", "neutral"]
+    # Check if RAVDESS path exists
+    if not os.path.exists(RAVDESS_PATH):
+        print(f"❌ Error: RAVDESS path not found: {RAVDESS_PATH}")
+        print("Please update the RAVDESS_PATH variable with the correct path.")
+        exit(1)
+    
+    # Test different analysis methods
+    analysis_configs = [
+        {"method": "standard", "task_metric": "emotion_representation", "use_enhanced": False},
+        {"method": "enhanced_shap", "task_metric": "shap_neuron_importance", "use_enhanced": True},
+        {"method": "entropy_based", "task_metric": "representation_entropy", "use_enhanced": False},
+        {"method": "attention_based", "task_metric": "attention_concentration", "use_enhanced": False}
+    ]
+    
+    emotions_to_test = ["happy"]
     
     for emotion in emotions_to_test:
-        print(f"\n{'🎭'*20}")
-        print(f"ANALYZING EMOTION: {emotion.upper()}")
-        print(f"{'🎭'*20}")
-        
-        try:
-            results, metadata = run_complete_layer_wise_analysis(
-                ravdess_path=RAVDESS_PATH,
-                emotion=emotion,
-                save_dir=f"results_{emotion}"
-            )
-            print(f"✅ Successfully analyzed {emotion} emotion")
+        for config in analysis_configs:
+            print(f"\n{'🎭'*20}")
+            print(f"ANALYZING EMOTION: {emotion.upper()} - METHOD: {config['method'].upper()}")
+            print(f"{'🎭'*20}")
             
-        except Exception as e:
-            print(f"❌ Error analyzing {emotion}: {e}")
-            import traceback
-            traceback.print_exc()
-            continue
+            try:
+                results, metadata = run_complete_layer_wise_analysis(
+                    ravdess_path=RAVDESS_PATH,
+                    emotion=emotion,
+                    save_dir=f"results_{emotion}_{config['method']}",
+                    use_enhanced_analysis=config['use_enhanced'],
+                    task_metric_type=config['task_metric']
+                )
+                print(f"✅ Successfully analyzed {emotion} with {config['method']}")
+                
+                # Memory cleanup after each analysis
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                
+            except Exception as e:
+                print(f"❌ Error analyzing {emotion} with {config['method']}: {e}")
+                import traceback
+                print(f"Full traceback: {traceback.format_exc()}")
+                continue
     
-    print(f"\n🎉 Analysis complete! Check the results_* directories for outputs.")
+    print(f"\n🎉 Multi-method analysis complete!")
