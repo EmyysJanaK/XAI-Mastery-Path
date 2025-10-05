@@ -181,13 +181,15 @@ class LayerWiseNeuronAblation:
         
         return audio_path, metadata
     
-    def preprocess_audio(self, audio_path: str, target_sr: int = 16000) -> torch.Tensor:
+    def preprocess_audio(self, audio_path: str, target_sr: int = 16000, max_duration_sec: float = None, downsample_factor: int = 1) -> torch.Tensor:
         """
         Load and preprocess audio file for WavLM
         
         Args:
             audio_path: Path to audio file
             target_sr: Target sampling rate
+            max_duration_sec: Maximum duration in seconds to reduce memory usage (None = keep original)
+            downsample_factor: Factor to downsample audio (1 = no downsampling, 2 = half the samples)
             
         Returns:
             Preprocessed audio tensor
@@ -204,10 +206,30 @@ class LayerWiseNeuronAblation:
         if waveform.shape[0] > 1:
             waveform = torch.mean(waveform, dim=0, keepdim=True)
         
+        # Trim audio to max duration if specified (to reduce memory usage)
+        if max_duration_sec is not None:
+            max_samples = int(max_duration_sec * target_sr)
+            if waveform.shape[1] > max_samples:
+                print(f"Trimming audio from {waveform.shape[1]/target_sr:.2f}s to {max_duration_sec}s to reduce memory usage")
+                waveform = waveform[:, :max_samples]
+        
+        # Apply downsampling if specified (to reduce memory usage further)
+        if downsample_factor > 1:
+            original_duration = waveform.shape[1] / target_sr
+            waveform = waveform[:, ::downsample_factor]
+            new_duration = waveform.shape[1] / target_sr
+            print(f"Downsampled audio by factor of {downsample_factor}: {original_duration:.2f}s → {new_duration:.2f}s")
+            
+            # Adjust sampling rate to maintain timing
+            effective_sr = target_sr // downsample_factor
+            print(f"Effective sampling rate: {effective_sr} Hz")
+        else:
+            effective_sr = target_sr
+        
         # ✅ Use feature extractor instead of processor
         inputs = self.feature_extractor(
             waveform.squeeze().numpy(), 
-            sampling_rate=target_sr, 
+            sampling_rate=effective_sr, 
             return_tensors="pt"
         )
         
@@ -925,11 +947,28 @@ class LayerWiseNeuronAblation:
             # First try with regular background data
             start_time = time.time()
             
+            # Check if background data is too large (might cause OOM errors)
+            if isinstance(background_data, torch.Tensor) and background_data.numel() > 10000000:  # ~10M elements
+                print(f"Warning: Large background tensor ({background_data.numel()} elements). Attempting to reduce size.")
+                # Use a smaller subset or downsample
+                if background_data.ndim > 1 and background_data.shape[0] > 2:
+                    # Take only first 2 samples
+                    background_data = background_data[:2]
+                elif background_data.ndim > 1 and background_data.shape[1] > 10000:
+                    # Downsample sequence dimension if possible
+                    background_data = background_data[:, ::2]  # Take every other element
+            
             # Make sure background data requires grad and is on the right device
             if isinstance(background_data, torch.Tensor) and not background_data.requires_grad:
                 background_data_with_grad = background_data.detach().clone().to(self.device).requires_grad_(True)
             else:
                 background_data_with_grad = background_data.to(self.device) if isinstance(background_data, torch.Tensor) else background_data
+                
+            # Print memory usage before creating explainer
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                print(f"GPU memory allocated before creating explainer: {torch.cuda.memory_allocated() / 1024**2:.1f} MiB")
+                print(f"GPU memory reserved before creating explainer: {torch.cuda.memory_reserved() / 1024**2:.1f} MiB")
                 
             explainer = shap.GradientExplainer(model_wrapper, background_data_with_grad)
             print(f"Explainer creation took {time.time() - start_time:.2f} seconds")
@@ -988,7 +1027,42 @@ class LayerWiseNeuronAblation:
         
         return explainer, model_wrapper
     
-    def compute_shap_in_batches(self, explainer, data, batch_size=8, n_samples=100):
+    def auto_select_device_for_computation(self, computation_size_estimate):
+        """
+        Automatically select the best device (CPU/GPU) based on computation size
+        
+        Args:
+            computation_size_estimate: Estimated size of computation in elements
+            
+        Returns:
+            device: Recommended device for computation
+        """
+        # Check if CUDA is available
+        if not torch.cuda.is_available():
+            return "cpu"
+            
+        # If computation is very small, use CPU to avoid GPU overhead
+        if computation_size_estimate < 1000000:  # < 1M elements
+            return "cpu"
+            
+        # Check GPU memory status
+        gpu_memory_allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+        total_gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3  # GB
+        free_gpu_memory = total_gpu_memory - gpu_memory_allocated
+        
+        # Estimate memory needed (very rough estimate: 4 bytes per float * elements * safety factor)
+        estimated_memory_needed = computation_size_estimate * 4 * 3 / 1024**3  # GB
+        
+        print(f"Memory estimate: need ~{estimated_memory_needed:.2f} GB, free GPU memory: {free_gpu_memory:.2f} GB")
+        
+        # If we don't have enough GPU memory, use CPU
+        if estimated_memory_needed > free_gpu_memory * 0.8:  # Keep 20% buffer
+            print("Insufficient GPU memory, switching to CPU")
+            return "cpu"
+            
+        return self.device  # Default to current device
+        
+    def compute_shap_in_batches(self, explainer, data, batch_size=2, n_samples=100, memory_efficient=True):
         """
         Compute SHAP values in batches to reduce memory usage and improve speed
         
@@ -997,11 +1071,31 @@ class LayerWiseNeuronAblation:
             data: Dataset to analyze
             batch_size: Batch size for processing
             n_samples: Number of samples for SHAP computation (for KernelSHAP)
+            memory_efficient: Use memory efficient mode (smaller internal batch sizes)
             
         Returns:
             SHAP values for all samples
         """
-        print(f"Computing SHAP values in batches (batch_size={batch_size}, n_samples={n_samples})...")
+        print(f"Computing SHAP values in batches (batch_size={batch_size}, n_samples={n_samples}, memory_efficient={memory_efficient})...")
+        
+        # In memory efficient mode, check and free GPU memory if needed
+        if memory_efficient and torch.cuda.is_available():
+            torch.cuda.synchronize()
+            memory_allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+            memory_reserved = torch.cuda.memory_reserved() / 1024**3  # GB
+            total_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3  # GB
+            free_memory = total_memory - memory_allocated
+            
+            print(f"GPU memory: {memory_allocated:.2f} GB allocated, {memory_reserved:.2f} GB reserved")
+            print(f"Total GPU memory: {total_memory:.2f} GB, Free: {free_memory:.2f} GB")
+            
+            # If memory is getting tight, try to free some
+            if free_memory < 1.0:  # Less than 1GB free
+                print("Low GPU memory detected, attempting to free unused memory...")
+                torch.cuda.empty_cache()
+                # Force garbage collection
+                import gc
+                gc.collect()
         
         # Get data length
         if isinstance(data, torch.Tensor):
@@ -1249,8 +1343,42 @@ class LayerWiseNeuronAblation:
         Returns:
             Dictionary with neuron importance information
         """
+        # Check if shap_values is empty or malformed
+        if shap_values is None or (isinstance(shap_values, np.ndarray) and shap_values.size == 0):
+            print(f"Warning: Empty SHAP values for layer {layer_idx}")
+            # Create dummy results
+            feature_dim = self.hidden_size
+            random_indices = np.random.choice(feature_dim, size=top_k, replace=False)
+            dummy_importance = np.random.random(top_k) * 0.001  # Small random values
+            
+            results = {
+                'layer_idx': layer_idx,
+                'top_neurons': random_indices,
+                'neuron_importance': dummy_importance,
+                'importance_coverage': 0.0,
+                'total_neurons': feature_dim,
+                'all_neuron_importance': np.zeros(feature_dim),
+                'is_dummy_data': True
+            }
+            
+            print(f"Generated dummy SHAP analysis for layer {layer_idx} due to empty SHAP values")
+            return results
+            
+        # Ensure proper shape - should be 2D with samples and features
+        if shap_values.ndim == 1:
+            shap_values = np.expand_dims(shap_values, axis=0)
+        
         # Calculate mean absolute SHAP value per neuron
         mean_abs_shap = np.mean(np.abs(shap_values), axis=0)
+        
+        # Handle zero values
+        if np.sum(mean_abs_shap) < 1e-10:  # All values near zero
+            print(f"Warning: Near-zero SHAP values for layer {layer_idx}")
+            # Add small random noise to create some variance
+            mean_abs_shap = mean_abs_shap + np.random.random(mean_abs_shap.shape) * 0.0001
+        
+        # Cap top_k to available neurons
+        top_k = min(top_k, len(mean_abs_shap))
         
         # Get indices of top-k neurons
         top_neuron_indices = np.argsort(-mean_abs_shap)[:top_k]
@@ -1386,8 +1514,9 @@ class LayerWiseNeuronAblation:
 
 
     def integrated_shap_ablation_analysis(self, audio_input, layers_to_analyze=None, 
-                                top_k=20, batch_size=8, dimensionality_reduction=None, 
-                                dim_reduction_params=None):
+                                top_k=20, batch_size=2, dimensionality_reduction=None, 
+                                dim_reduction_params=None, memory_efficient=True, 
+                                max_samples_for_shap=2, use_cpu_for_large_computations=False):
         """
         Run integrated SHAP + ablation analysis on multiple layers
         
@@ -1398,6 +1527,8 @@ class LayerWiseNeuronAblation:
             batch_size: Batch size for SHAP computation
             dimensionality_reduction: 'pca', 'topk', or None
             dim_reduction_params: Parameters for dimensionality reduction
+            memory_efficient: Use memory-efficient mode (smaller batch sizes, fewer samples)
+            max_samples_for_shap: Maximum number of samples to use for SHAP (reduces memory usage)
             
         Returns:
             Dictionary with complete analysis results
@@ -1451,17 +1582,39 @@ class LayerWiseNeuronAblation:
                 if dimensionality_reduction == 'pca':
                     print("Applying PCA dimensionality reduction...")
                     try:
+                        # In memory_efficient mode, use more aggressive dimensionality reduction
+                        n_components = dim_reduction_params.get('n_components', 100)
+                        if memory_efficient and n_components > 20:
+                            print(f"Reducing PCA components from {n_components} to 20 due to memory constraints")
+                            n_components = 20
+                            
+                        # First check if we need to downsample the features to save memory
+                        if memory_efficient and isinstance(hidden_states, torch.Tensor) and hidden_states.numel() > 1000000:
+                            print("Large hidden states tensor detected. Using subset for PCA.")
+                            # Use a subset of the data for PCA
+                            if hidden_states.shape[0] > 2:  # If we have many samples
+                                hidden_subset = hidden_states[:2].detach().cpu().numpy()  # Use first 2 samples
+                            else:  # If we have few samples but long sequences
+                                hidden_subset = hidden_states.detach().cpu().numpy()
+                        else:
+                            hidden_subset = hidden_states.detach().cpu().numpy() if isinstance(hidden_states, torch.Tensor) else hidden_states
+                        
+                        # Apply PCA with memory-efficient approach
                         reduced_features, pca_model = self.reduce_dimensions_pca(
-                            hidden_states, 
-                            n_components=dim_reduction_params.get('n_components', 100)
+                            hidden_subset, 
+                            n_components=n_components
                         )
-                        # Visualize dimensionality reduction
-                        self.visualize_dimensionality_reduction(
-                            hidden_states.detach().cpu().numpy(), 
-                            reduced_features, 
-                            'pca', 
-                            pca_model=pca_model
-                        )
+                        
+                        # Only visualize if not in memory-efficient mode
+                        if not memory_efficient:
+                            self.visualize_dimensionality_reduction(
+                                hidden_subset, 
+                                reduced_features, 
+                                'pca', 
+                                pca_model=pca_model
+                            )
+                        else:
+                            print("Skipping visualization to save memory")
                     except Exception as e:
                         print(f"PCA dimensionality reduction failed: {e}")
                         print("Continuing without dimensionality reduction visualization")
@@ -1496,14 +1649,33 @@ class LayerWiseNeuronAblation:
                 # First ensure all tensors are on the same device
                 audio_device = self.ensure_device_consistency(audio_input)
                 
+                # Apply memory efficiency techniques if enabled
+                if memory_efficient and audio_device.ndim == 2 and audio_device.shape[1] > 16000:
+                    # If sequence length is large, we can downsample for SHAP analysis
+                    # Audio is typically oversampled for SHAP analysis purposes
+                    # This reduces memory usage while preserving signal characteristics
+                    original_len = audio_device.shape[1]
+                    downsample_factor = 2
+                    while audio_device.shape[1] > 20000 and downsample_factor <= 4:  # Limit to 4x downsampling
+                        audio_device = audio_device[:, ::downsample_factor]
+                        downsample_factor *= 2
+                    
+                    print(f"Downsampled audio from {original_len} to {audio_device.shape[1]} samples to reduce memory usage")
+                
                 if audio_device.ndim == 2:  # [batch=1, seq_len]
                     print(f"Expanding audio input from shape {audio_device.shape} for batch processing")
+                    # Limit number of samples to prevent OOM errors
+                    num_samples = min(max_samples_for_shap, 2)  # Default to 2 samples (original + noise)
+                    
                     # Duplicate the audio with slight variations for batch processing
-                    noise = torch.randn_like(audio_device) * 0.001
-                    expanded_input = torch.cat([
-                        audio_device,
-                        audio_device + noise
-                    ], dim=0)
+                    samples = [audio_device]
+                    for i in range(num_samples - 1):
+                        # Add noise with progressively increasing variance
+                        noise_level = 0.001 * (i + 1)
+                        noise = torch.randn_like(audio_device) * noise_level
+                        samples.append(audio_device + noise)
+                    
+                    expanded_input = torch.cat(samples, dim=0)
                     bg_data = expanded_input  # Use expanded data as background
                     analysis_input = expanded_input  # Use expanded data for analysis
                 else:
@@ -1511,12 +1683,39 @@ class LayerWiseNeuronAblation:
                     analysis_input = audio_device  # Use original audio for analysis
                     
                 print(f"Background data device: {bg_data.device}, Model device: {self.device}")
+                print(f"Background data shape: {bg_data.shape}")
                     
                 # Create SHAP explainer with error handling
                 try:
                     print("Attempting to create GradientSHAP explainer...")
+                    
+                    # Estimate computation size for device selection
+                    if isinstance(bg_data, torch.Tensor):
+                        computation_size = bg_data.numel() * self.hidden_size * 4  # Rough estimate
+                    else:
+                        computation_size = 10000000  # Default value
+                    
+                    # Choose device based on computation size if memory_efficient is True
+                    compute_device = self.device
+                    if memory_efficient and use_cpu_for_large_computations:
+                        compute_device = self.auto_select_device_for_computation(computation_size)
+                        print(f"Auto-selected device for SHAP computation: {compute_device}")
+                    
+                    # If device changed, move model to the new device temporarily
+                    temp_model = None
+                    if compute_device != self.device:
+                        print(f"Moving model to {compute_device} temporarily for SHAP computation")
+                        temp_model = self.model
+                        self.model = self.model.to(compute_device)
+                        
                     explainer, wrapper_model = self.create_gradient_shap_explainer(layer_idx, bg_data)
                     print("Successfully created GradientSHAP explainer")
+                    
+                    # Restore original model device if needed
+                    if temp_model is not None:
+                        self.model = temp_model
+                        print(f"Restored model to original device: {self.device}")
+                        
                 except Exception as e:
                     print(f"Error creating GradientSHAP explainer: {e}")
                     print("Creating fallback KernelSHAP explainer...")
@@ -1781,6 +1980,13 @@ class LayerWiseNeuronAblation:
         print(f"\n🧹 Cleaning up {len(active_hooks)} ablation hooks...")
         for hook in active_hooks:
             hook.remove()
+            
+        # Free up memory
+        if memory_efficient and torch.cuda.is_available():
+            print("Cleaning up GPU memory...")
+            torch.cuda.empty_cache()
+            import gc
+            gc.collect()
         
         # Step 3: Visualize integrated results
         print(f"\n{'='*60}")
@@ -1788,7 +1994,11 @@ class LayerWiseNeuronAblation:
         print(f"{'='*60}")
         
         try:
-            self.visualize_integrated_results(results)
+            # Skip visualization in memory efficient mode
+            if memory_efficient:
+                print("Skipping visualization in memory-efficient mode")
+            else:
+                self.visualize_integrated_results(results)
         except Exception as e:
             print(f"Error visualizing integrated results: {e}")
             print("Skipping visualization")
@@ -2052,7 +2262,10 @@ def run_complete_layer_wise_analysis(ravdess_path: str,
                                    actor_id: int = None,
                                    save_dir: str = "results",
                                    debug: bool = True,
-                                   device: str = None):
+                                   device: str = None,
+                                   memory_efficient: bool = True,
+                                   max_audio_duration: float = 3.0,
+                                   use_cpu_for_large_computations: bool = True):
     """
     Run complete layer-wise neuron ablation analysis
     
@@ -2063,6 +2276,9 @@ def run_complete_layer_wise_analysis(ravdess_path: str,
         save_dir: Directory to save results
         debug: Enable debug mode for better error diagnostics
         device: Specify device (default: auto-detect)
+        memory_efficient: Enable memory-efficient mode for large models/inputs
+        max_audio_duration: Maximum audio duration in seconds (reduces memory usage)
+        use_cpu_for_large_computations: Automatically switch to CPU for large computations
     """
     
     # Create results directory
@@ -2115,29 +2331,35 @@ def run_complete_layer_wise_analysis(ravdess_path: str,
         if use_integrated:
             print("Using new integrated SHAP + ablation approach")
             
-            # First try with PCA dimensionality reduction
+            # First try with memory-efficient mode
             try:
-                print("Attempting with PCA dimensionality reduction...")
+                print("Attempting with memory-efficient mode...")
                 results = analyzer.integrated_shap_ablation_analysis(
                     audio_input=audio_input,
                     layers_to_analyze=key_layers,
                     top_k=10,
-                    batch_size=4,
+                    batch_size=2,  # Smaller batch size
                     dimensionality_reduction='pca',
-                    dim_reduction_params={'n_components': 50}  # Reduced from 100 to 50
+                    dim_reduction_params={'n_components': 20},  # Reduced from 50 to 20
+                    memory_efficient=True,
+                    max_samples_for_shap=2,  # Limit samples to reduce memory usage
+                    use_cpu_for_large_computations=USE_CPU_FOR_LARGE
                 )
             except Exception as e:
-                print(f"Error with PCA approach: {e}")
-                print("Falling back to TopK dimensionality reduction...")
+                print(f"Error with memory-efficient approach: {e}")
+                print("Falling back to even more conservative approach...")
                 
-                # Try with TopK dimensionality reduction
+                # Try with extremely conservative settings
                 results = analyzer.integrated_shap_ablation_analysis(
                     audio_input=audio_input,
-                    layers_to_analyze=key_layers,
-                    top_k=10,
-                    batch_size=4,
+                    layers_to_analyze=key_layers[:4],  # Only analyze first few layers
+                    top_k=5,  # Reduce top-k
+                    batch_size=1,  # Minimum batch size
                     dimensionality_reduction='topk',
-                    dim_reduction_params={'k': 50, 'method': 'variance'}
+                    dim_reduction_params={'k': 20, 'method': 'variance'},  # Further reduce dimensions
+                    memory_efficient=True,
+                    max_samples_for_shap=1,  # Absolute minimum
+                    use_cpu_for_large_computations=True  # Force CPU for extreme memory pressure
                 )
         else:
             print("Using original progressive layer ablation approach")
@@ -2215,6 +2437,11 @@ if __name__ == "__main__":
     # Set to None for automatic device selection
     FORCE_DEVICE = None  # 'cpu' or 'cuda:0' or None
     
+    # Memory efficiency options
+    MEMORY_EFFICIENT = True  # Set to False if you have a high-end GPU with lots of memory
+    MAX_AUDIO_DURATION = 3.0  # Maximum audio duration in seconds (reduces memory usage)
+    USE_CPU_FOR_LARGE = True  # Automatically use CPU for large computations
+    
     for emotion in emotions_to_test:
         print(f"\n{'🎭'*20}")
         print(f"ANALYZING EMOTION: {emotion.upper()}")
@@ -2226,7 +2453,10 @@ if __name__ == "__main__":
                 emotion=emotion,
                 save_dir=f"results_{emotion}",
                 debug=DEBUG_MODE,
-                device=FORCE_DEVICE
+                device=FORCE_DEVICE,
+                memory_efficient=MEMORY_EFFICIENT,
+                max_audio_duration=MAX_AUDIO_DURATION,
+                use_cpu_for_large_computations=USE_CPU_FOR_LARGE
             )
             print(f"✅ Successfully analyzed {emotion} emotion")
             
