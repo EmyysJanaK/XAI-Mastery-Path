@@ -16,78 +16,58 @@ from tqdm import tqdm
 from transformers import AutoModel, AutoFeatureExtractor
 from torch.utils.data import DataLoader
 import librosa
-import re # Make sure re is imported
+import re 
 
 try:
     import parselmouth
 except ImportError:
     print("Warning: parselmouth not found. Please run 'pip install parselmouth-praat'. Acoustic feature extraction will fail.")
 
-# <<< NEW HELPER CLASS FOR ACOUSTIC FEATURE EXTRACTION >>>
 class AcousticFeatureExtractor:
     """A helper class to extract various acoustic features from an audio file."""
     def __init__(self, sample_rate=16000):
         self.sr = sample_rate
 
     def __call__(self, waveform: np.ndarray) -> Dict[str, float]:
-        """
-        Extracts all supported acoustic features from a raw waveform.
-
-        Args:
-            waveform (np.ndarray): The audio waveform.
-
-        Returns:
-            Dict[str, float]: A dictionary of extracted scalar feature values.
-        """
-        # Use parselmouth for pitch, jitter, HNR, and formants
+        """Extracts all supported acoustic features from a raw waveform."""
         try:
             sound = parselmouth.Sound(waveform, sampling_frequency=self.sr)
             pitch = sound.to_pitch()
-            # Calculate mean pitch, handling frames with no pitch
             pitch_values = pitch.selected_array['frequency']
             pitch_mean = np.nanmean(pitch_values[pitch_values != 0]) if np.any(pitch_values) else 0.0
             
             point_process = parselmouth.praat.call(sound, "To PointProcess (periodic, cc)", pitch.floor, pitch.ceiling)
-            jitter = parselmouth.praat.call(point_process, "Get jitter (local)", 0, 0, 0.0001, 0.02, 1.3) * 100 # In %
+            jitter = parselmouth.praat.call(point_process, "Get jitter (local)", 0, 0, 0.0001, 0.02, 1.3) * 100
             
             harmonicity = sound.to_harmonicity()
-            # Calculate mean HNR, handling undefined frames
             hnr_values = harmonicity.values[harmonicity.values != -200]
             hnr = np.nanmean(hnr_values) if len(hnr_values) > 0 else 0.0
 
             formants = sound.to_formant_burg()
             f1_mean = np.nanmean([formants.get_value_at_time(1, parselmouth.FormantUnit.HERTZ, t) for t in formants.ts()]) if formants.nt > 0 else 0.0
             f2_mean = np.nanmean([formants.get_value_at_time(2, parselmouth.FormantUnit.HERTZ, t) for t in formants.ts()]) if formants.nt > 0 else 0.0
-        
-        except Exception as e:
-            # Fallback if parselmouth fails
-            # print(f"Parselmouth feature extraction failed: {e}. Using 0.0 as fallback.")
+        except Exception:
             pitch_mean, jitter, hnr, f1_mean, f2_mean = 0.0, 0.0, 0.0, 0.0, 0.0
 
-        # Use librosa for other features
         loudness = librosa.feature.rms(y=waveform).mean()
-        # Use onsets to get a more reliable tempo
-        onsets = librosa.onset.onset_detect(y=waveform, sr=self.sr)
-        speech_rate = librosa.beat.tempo(onset_envelope=librosa.onset.onset_strength(y=waveform, sr=self.sr), sr=self.sr)[0] if len(onsets) > 2 else 60.0 # fallback tempo
+        # Updated to the new librosa function name to remove the warning
+        onset_env = librosa.onset.onset_strength(y=waveform, sr=self.sr)
+        speech_rate = librosa.feature.tempo(onset_envelope=onset_env, sr=self.sr)[0]
+        
         zcr = librosa.feature.zero_crossing_rate(y=waveform).mean()
         mfccs = librosa.feature.mfcc(y=waveform, sr=self.sr, n_mfcc=13)
         mfcc_mean = mfccs.mean()
 
         return {
-            # SER Features
-            "Pitch": float(pitch_mean),
-            "Loudness": float(loudness),
-            "Speech Rate": float(speech_rate),
-            "Jitter": float(jitter),
-            "Harmonic-to-Noise Ratio": float(hnr),
-            "Zero Crossing Rate": float(zcr),
-            # SID Features (reusing some and adding new ones)
+            "Pitch": float(pitch_mean), "Loudness": float(loudness),
+            "Speech Rate": float(speech_rate), "Jitter": float(jitter),
+            "Harmonic-to-Noise Ratio": float(hnr), "Zero Crossing Rate": float(zcr),
             "Average Spectral Shape (MFCCs)": float(mfcc_mean),
-            "Vocal Tract Resonance (F1)": float(f1_mean),
-            "Vocal Tract Resonance (F2)": float(f2_mean),
+            "Vocal Tract Resonance (F1)": float(f1_mean), "Vocal Tract Resonance (F2)": float(f2_mean),
         }
 
 class LayerwiseSignFlipAblation:
+    # ... (Most of the class remains the same)
     def __init__(self, model_name: str = 'microsoft/wavlm-base-plus', **kwargs):
         self.model_name = model_name
         self.device = kwargs.get('device') or ('cuda' if torch.cuda.is_available() else 'cpu')
@@ -181,7 +161,7 @@ class LayerwiseSignFlipAblation:
         accuracy = correct / total if total > 0 else 0
         print(f"{probe_type} Accuracy: {accuracy:.4f}")
         return accuracy
-    
+
     def run_acoustic_evaluation(self, dataloader: DataLoader) -> Dict[str, float]:
         """Runs evaluation for all acoustic regression probes and returns their MSE."""
         mse_results = {fname: 0.0 for fname in self.acoustic_features_list}
@@ -193,7 +173,7 @@ class LayerwiseSignFlipAblation:
                 outputs = self.model(input_values=input_values)
                 pooled_output = torch.mean(outputs.last_hidden_state, dim=1)
                 total_samples += input_values.size(0)
-                
+
                 for fname in self.acoustic_features_list:
                     probe = self.acoustic_probes[fname]
                     probe.eval()
@@ -210,7 +190,6 @@ class LayerwiseSignFlipAblation:
         print("Running baseline evaluation...")
         self.remove_hook()
         
-        # Classification tasks
         ser_accuracy = self.run_evaluation(ser_dataloader, "SER")
         sid_accuracy = self.run_evaluation(sid_dataloader, "SID")
         self.baseline_results = {"SER": ser_accuracy, "SID": sid_accuracy}
@@ -230,13 +209,11 @@ class LayerwiseSignFlipAblation:
             print(f"\n--- Layer {layer_idx} Ablation ---")
             self.register_hook(layer_idx)
             
-            # Classification ablation
             ser_acc = self.run_evaluation(ser_dataloader, "SER")
             sid_acc = self.run_evaluation(sid_dataloader, "SID")
             ser_drops.append(self.baseline_results["SER"] - ser_acc)
             sid_drops.append(self.baseline_results["SID"] - sid_acc)
 
-            # Acoustic probes ablation
             ablated_mses = self.run_acoustic_evaluation(acoustic_dataloader)
             for fname in self.acoustic_features_list:
                 baseline_mse = self.acoustic_baseline_results.get(fname, 0)
@@ -283,7 +260,6 @@ class LayerwiseSignFlipAblation:
         plt.show()
     
     def visualize_acoustic_results(self, save_path: Optional[str] = None) -> None:
-        """Visualizes the increase in MSE for each acoustic feature probe."""
         if not self.acoustic_ablation_results:
             raise ValueError("No acoustic ablation results to visualize. Run the study first.")
             
@@ -292,10 +268,9 @@ class LayerwiseSignFlipAblation:
         
         layer_indices = list(range(self.num_layers))
 
-        # --- SER Features Plot ---
         num_ser_features = len(ser_features)
         fig1, axes1 = plt.subplots(nrows=num_ser_features, ncols=1, figsize=(12, 4 * num_ser_features), sharex=True)
-        if num_ser_features == 1: axes1 = [axes1] # Ensure axes1 is always iterable
+        if num_ser_features == 1: axes1 = [axes1]
         fig1.suptitle('Ablation Impact on SER-related Acoustic Features (MSE Increase)', fontsize=18)
         for i, fname in enumerate(ser_features):
             mse_increases = self.acoustic_ablation_results.get(fname, [0]*self.num_layers)
@@ -312,10 +287,9 @@ class LayerwiseSignFlipAblation:
             print(f"SER acoustic visualization saved to {ser_path}")
         plt.show()
 
-        # --- SID Features Plot ---
         num_sid_features = len(sid_features)
         fig2, axes2 = plt.subplots(nrows=num_sid_features, ncols=1, figsize=(12, 4 * num_sid_features), sharex=True)
-        if num_sid_features == 1: axes2 = [axes2] # Ensure axes2 is always iterable
+        if num_sid_features == 1: axes2 = [axes2]
         fig2.suptitle('Ablation Impact on SID-related Acoustic Features (MSE Increase)', fontsize=18)
         for i, fname in enumerate(sid_features):
             mse_increases = self.acoustic_ablation_results.get(fname, [0]*self.num_layers)
@@ -331,9 +305,8 @@ class LayerwiseSignFlipAblation:
             plt.savefig(sid_path, dpi=300, bbox_inches='tight')
             print(f"SID acoustic visualization saved to {sid_path}")
         plt.show()
-    
+
     def create_and_train_acoustic_probes(self, train_dataloader: DataLoader, num_epochs: int = 10, learning_rate: float = 1e-3):
-        """Trains linear regression probes for each acoustic feature."""
         print("Training acoustic feature regression probes...")
         criterion = torch.nn.MSELoss()
         
@@ -361,12 +334,10 @@ class LayerwiseSignFlipAblation:
                     total_loss += loss.item()
                 
                 print(f"Epoch {epoch+1} Loss for {fname}: {total_loss / len(train_dataloader):.6f}")
-    
+
     def create_and_train_probes(self, ser_train_dataloader, sid_train_dataloader, num_epochs=5, learning_rate=1e-4, ser_save_path=None, sid_save_path=None):
         print("Training classification probes...")
-        hidden_size = self.model.config.hidden_size
         
-        # Train SER Probe
         ser_probe = self.ser_probe
         ser_probe.to(self.device)
         criterion = torch.nn.CrossEntropyLoss()
@@ -374,7 +345,6 @@ class LayerwiseSignFlipAblation:
         for epoch in range(num_epochs):
             ser_probe.train()
             for batch in tqdm(ser_train_dataloader, desc=f"SER Train Epoch {epoch+1}", leave=False):
-                 # ... training logic from original code ...
                 input_values = batch["input_values"].to(self.device)
                 labels = batch["labels"].to(self.device)
                 optimizer.zero_grad()
@@ -386,15 +356,14 @@ class LayerwiseSignFlipAblation:
                 loss.backward()
                 optimizer.step()
         if ser_save_path: torch.save(ser_probe.state_dict(), ser_save_path)
+        print("Finished training SER probe.")
 
-        # Train SID Probe
         sid_probe = self.sid_probe
         sid_probe.to(self.device)
         optimizer = torch.optim.Adam(sid_probe.parameters(), lr=learning_rate)
         for epoch in range(num_epochs):
             sid_probe.train()
             for batch in tqdm(sid_train_dataloader, desc=f"SID Train Epoch {epoch+1}", leave=False):
-                # ... training logic from original code ...
                 input_values = batch["input_values"].to(self.device)
                 labels = batch["actor_labels"].to(self.device)
                 optimizer.zero_grad()
@@ -406,63 +375,81 @@ class LayerwiseSignFlipAblation:
                 loss.backward()
                 optimizer.step()
         if sid_save_path: torch.save(sid_probe.state_dict(), sid_save_path)
-        
+        print("Finished training SID probe.")
+
+    # <<< MODIFICATION IS HERE: Optimized Data Loading >>>
     def create_ravdess_dataloaders(self, ravdess_path: str, **kwargs) -> Dict[str, DataLoader]:
         import pandas as pd
         from sklearn.model_selection import train_test_split
         
-        class RavdessDataset(torch.utils.data.Dataset):
-            def __init__(self, metadata_df, feature_extractor_hf, acoustic_feature_extractor):
-                self.metadata_df = metadata_df
+        # This new lightweight dataset works with pre-processed, cached data
+        class CachedAcousticDataset(torch.utils.data.Dataset):
+            def __init__(self, cached_data, feature_extractor_hf):
+                self.cached_data = cached_data
                 self.feature_extractor_hf = feature_extractor_hf
-                self.acoustic_feature_extractor = acoustic_feature_extractor
-                self.target_sr = 16000
-                self.max_length = 160000
 
             def __len__(self):
-                return len(self.metadata_df)
+                return len(self.cached_data)
 
             def __getitem__(self, idx):
-                row = self.metadata_df.iloc[idx]
-                audio_file = row['file']
-                try:
-                    waveform, _ = librosa.load(audio_file, sr=self.target_sr, mono=True)
-                except Exception as e:
-                    print(f"Error loading {audio_file}: {e}. Skipping.")
-                    return self.__getitem__((idx + 1) % len(self)) # Return next item on error
-
-                if len(waveform) > self.max_length: waveform = waveform[:self.max_length]
-                else: waveform = np.pad(waveform, (0, self.max_length - len(waveform)), 'constant')
+                data_point = self.cached_data[idx]
                 
-                inputs_hf = self.feature_extractor_hf(waveform, sampling_rate=self.target_sr, return_tensors="pt")
-                acoustic_features = self.acoustic_feature_extractor(waveform)
+                # The only processing done here is the fast HF feature extraction
+                inputs_hf = self.feature_extractor_hf(
+                    data_point['waveform'], 
+                    sampling_rate=16000, 
+                    return_tensors="pt"
+                )
                 
+                # Combine with cached features
                 item = {
                     "input_values": inputs_hf.input_values.squeeze(),
-                    "labels": torch.tensor(row['emotion'], dtype=torch.long),
-                    "actor_labels": torch.tensor(row['actor'], dtype=torch.long),
+                    **data_point # Add all other pre-calculated features
                 }
-                for fname, fval in acoustic_features.items():
-                    item[fname] = torch.tensor(fval, dtype=torch.float32)
+                # We don't need the raw waveform anymore
+                del item['waveform']
                 return item
 
-        print(f"Loading RAVDESS dataset from {ravdess_path}")
+        # This new helper function does the slow pre-processing ONCE
+        def _preprocess_and_cache_data(metadata_df, acoustic_feature_extractor):
+            cached_data = []
+            max_length = 160000
+            target_sr = 16000
+
+            for _, row in tqdm(metadata_df.iterrows(), total=len(metadata_df), desc="Preprocessing and Caching Data"):
+                file_path = row['file']
+                try:
+                    waveform, _ = librosa.load(file_path, sr=target_sr, mono=True)
+                except Exception as e:
+                    print(f"Warning: Could not load {file_path}, skipping. Error: {e}")
+                    continue
+
+                if len(waveform) > max_length: waveform = waveform[:max_length]
+                else: waveform = np.pad(waveform, (0, max_length - len(waveform)), 'constant')
+
+                acoustic_features = acoustic_feature_extractor(waveform)
+                
+                data_point = {
+                    'waveform': waveform,
+                    'labels': torch.tensor(row['emotion'], dtype=torch.long),
+                    'actor_labels': torch.tensor(row['actor'], dtype=torch.long),
+                    **{fname: torch.tensor(fval, dtype=torch.float32) for fname, fval in acoustic_features.items()}
+                }
+                cached_data.append(data_point)
+            return cached_data
+
+        print(f"Scanning RAVDESS dataset from {ravdess_path}")
         feature_extractor_hf = AutoFeatureExtractor.from_pretrained(self.model_name)
         acoustic_feature_extractor = AcousticFeatureExtractor(sample_rate=16000)
         
         audio_files = [os.path.join(r, f) for r, d, files in os.walk(ravdess_path) for f in files if f.endswith('.wav')]
         
-        # <<< FIX IS HERE: Robust filename parsing >>>
         metadata = []
         for file_path in audio_files:
             filename = os.path.basename(file_path)
             parts = re.match(r'(\d+)-(\d+)-(\d+)-(\d+)-(\d+)-(\d+)-(\d+)\.wav', filename)
             if parts:
-                metadata.append({
-                    'file': file_path,
-                    'emotion': int(parts.group(3)) - 1,
-                    'actor': int(parts.group(7)) - 1
-                })
+                metadata.append({'file': file_path, 'emotion': int(parts.group(3)) - 1, 'actor': int(parts.group(7)) - 1})
         
         if not metadata:
             raise ValueError("No valid RAVDESS files found. Check path and file naming.")
@@ -470,19 +457,24 @@ class LayerwiseSignFlipAblation:
         df = pd.DataFrame(metadata)
         train_df, test_df = train_test_split(df, train_size=0.8, random_state=42, stratify=df[['emotion', 'actor']])
 
-        train_dataset = RavdessDataset(train_df, feature_extractor_hf, acoustic_feature_extractor)
-        test_dataset = RavdessDataset(test_df, feature_extractor_hf, acoustic_feature_extractor)
+        # --- Execute the one-time pre-processing ---
+        train_cache = _preprocess_and_cache_data(train_df, acoustic_feature_extractor)
+        test_cache = _preprocess_and_cache_data(test_df, acoustic_feature_extractor)
+
+        train_dataset = CachedAcousticDataset(train_cache, feature_extractor_hf)
+        test_dataset = CachedAcousticDataset(test_cache, feature_extractor_hf)
         
         batch_size = kwargs.get('batch_size', 16)
         
-        acoustic_train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-        acoustic_test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
 
         return {
-            'ser_train': acoustic_train_loader, 'ser_test': acoustic_test_loader,
-            'sid_train': acoustic_train_loader, 'sid_test': acoustic_test_loader,
-            'acoustic_train': acoustic_train_loader, 'acoustic_test': acoustic_test_loader
+            'ser_train': train_loader, 'ser_test': test_loader,
+            'sid_train': train_loader, 'sid_test': test_loader,
+            'acoustic_train': train_loader, 'acoustic_test': test_loader
         }
+
 
 # Example usage
 if __name__ == "__main__":
@@ -502,7 +494,8 @@ if __name__ == "__main__":
     
     try:
         if not os.path.exists(ravdess_path) or not os.listdir(ravdess_path):
-             raise FileNotFoundError
+             raise FileNotFoundError("RAVDESS path not found or is empty.")
+        # This will now perform the one-time caching, which may take a moment.
         dataloaders = ablation_study.create_ravdess_dataloaders(ravdess_path=ravdess_path, batch_size=8)
     except (FileNotFoundError, ValueError) as e:
         print(f"Error loading dataset: {e}. Aborting.")
