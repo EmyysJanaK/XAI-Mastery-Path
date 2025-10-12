@@ -7,6 +7,14 @@ across transformer layers to measure the impact on downstream speech tasks and o
 model's ability to represent low-level acoustic features.
 """
 
+# TODO:
+#     I need to show how each sub-feature can vary layer by layer 
+#     in both situations: when flipped and when not flipped.
+#     Also, plot each sub-feature in SER and SID plots.
+#    Finally, I need to show how the accuracy drops layer by layer
+#     for SER and SID when the sign-flip ablation is applied.
+#  
+
 import os
 import torch
 import numpy as np
